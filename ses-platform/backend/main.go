@@ -31,25 +31,27 @@ type Enabler struct {
 }
 
 type Environment struct {
-	ID             string    `gorm:"primaryKey" json:"id"`
-	Name           string    `json:"name"`
-	Description    string    `json:"description"`
-	Owner          string    `json:"owner"`
-	Tags           string    `json:"tags"`
-	Status         string    `json:"status"` // provisioning, running, stopped, error
-	Capabilities   string    `json:"capabilities"` // JSON array
-	EnablersConfig string    `json:"enablers_config"` // JSON object
-	ComputeConfig  string    `json:"compute_config"` // JSON object
-	Storage        int       `json:"storage"`
-	Network        string    `json:"network"`
-	Priority       string    `json:"priority"`
-	Duration       int       `json:"duration"`
-	EstimatedCost  float64   `json:"estimated_cost"`
-	ActualCost     float64   `json:"actual_cost"`
-	Health         int       `json:"health"`
-	Uptime         string    `json:"uptime"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID                 string    `gorm:"primaryKey" json:"id"`
+	Name               string    `json:"name"`
+	Description        string    `json:"description"`
+	Owner              string    `json:"owner"`
+	Tags               string    `json:"tags"`
+	Status             string    `json:"status"` // provisioning, running, stopped, error
+	Capabilities       string    `json:"capabilities"` // JSON array
+	EnablersConfig     string    `json:"enablers_config"` // JSON object
+	ComputeConfig      string    `json:"compute_config"` // JSON object
+	Storage            int       `json:"storage"`
+	Network            string    `json:"network"`
+	Priority           string    `json:"priority"`
+	Duration           int       `json:"duration"`
+	EstimatedCost      float64   `json:"estimated_cost"`
+	ActualCost         float64   `json:"actual_cost"`
+	Health             int       `json:"health"`
+	Uptime             string    `json:"uptime"`
+	FleetWiseConfig    string    `json:"fleetwise_config"` // JSON object for AWS FleetWise configuration
+	UseRealAWSBackend  bool      `json:"use_real_aws_backend"` // Flag to use real AWS instead of simulation
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 type StateTransition struct {
@@ -94,17 +96,19 @@ type Reservation struct {
 
 // Request/Response DTOs
 type CreateEnvironmentRequest struct {
-	Name           string                 `json:"name" binding:"required"`
-	Description    string                 `json:"description"`
-	Owner          string                 `json:"owner"`
-	Tags           string                 `json:"tags"`
-	Capabilities   []string               `json:"capabilities"`
-	EnablersConfig map[string]interface{} `json:"enablers"`
-	Compute        ComputeConfig          `json:"compute"`
-	Storage        int                    `json:"storage"`
-	Network        string                 `json:"network"`
-	Priority       string                 `json:"priority"`
-	Duration       int                    `json:"duration"`
+	Name              string                 `json:"name" binding:"required"`
+	Description       string                 `json:"description"`
+	Owner             string                 `json:"owner"`
+	Tags              string                 `json:"tags"`
+	Capabilities      []string               `json:"capabilities"`
+	EnablersConfig    map[string]interface{} `json:"enablers"`
+	Compute           ComputeConfig          `json:"compute"`
+	Storage           int                    `json:"storage"`
+	Network           string                 `json:"network"`
+	Priority          string                 `json:"priority"`
+	Duration          int                    `json:"duration"`
+	FleetWiseConfig   *FleetWiseConfig       `json:"fleetwise_config,omitempty"`
+	UseRealAWSBackend bool                   `json:"use_real_aws_backend"`
 }
 
 type ComputeConfig struct {
@@ -184,6 +188,24 @@ func main() {
 		// Audit and History
 		v1.GET("/audit", getAuditLogs)
 		v1.GET("/environments/:id/history", getEnvironmentHistory)
+
+		// AWS FleetWise Operations
+		v1.POST("/fleetwise/vehicles", createFleetWiseVehicle)
+		v1.POST("/fleetwise/vehicles/batch", batchCreateFleetWiseVehicles)
+		v1.GET("/fleetwise/vehicles/:name", getFleetWiseVehicle)
+		v1.PUT("/fleetwise/vehicles/:name", updateFleetWiseVehicle)
+		v1.DELETE("/fleetwise/vehicles/:name", deleteFleetWiseVehicle)
+		v1.GET("/fleetwise/vehicles/:name/status", getFleetWiseVehicleStatus)
+		v1.GET("/fleetwise/vehicles", listFleetWiseVehicles)
+
+		v1.POST("/fleetwise/campaigns", createFleetWiseCampaign)
+		v1.GET("/fleetwise/campaigns/:name", getFleetWiseCampaign)
+		v1.PUT("/fleetwise/campaigns/:name", updateFleetWiseCampaign)
+		v1.DELETE("/fleetwise/campaigns/:name", deleteFleetWiseCampaign)
+		v1.GET("/fleetwise/campaigns", listFleetWiseCampaigns)
+
+		v1.POST("/fleetwise/fleets", createFleetWiseFleet)
+		v1.POST("/fleetwise/fleets/:id/vehicles", associateVehicleToFleet)
 	}
 
 	// Start server
@@ -222,6 +244,7 @@ func seedData() {
 		{ID: "C08", Name: "Cost Management", Description: "Real-time cost tracking", Enablers: `["E08","E16","E06","E11"]`, Dependencies: `["C06"]`},
 		{ID: "C09", Name: "Security & Compliance", Description: "Credential vault, RBAC", Enablers: `["E09","E10","E19","E01"]`, Dependencies: `[]`},
 		{ID: "C12", Name: "Simulation Execution", Description: "Runs scenarios", Enablers: `["E12","E13","E04","E06","E20"]`, Dependencies: `["C04"]`},
+		{ID: "C19", Name: "AWS Automotive Integration", Description: "Real AWS IoT FleetWise integration for vehicle simulation", Enablers: `["E05","E21","E01","E18","E20"]`, Dependencies: `["C04","C09","C14"]`},
 	}
 	for _, cap := range capabilities {
 		db.FirstOrCreate(&cap, Capability{ID: cap.ID})
@@ -277,26 +300,35 @@ func createEnvironment(c *gin.Context) {
 	enablersJSON, _ := json.Marshal(req.EnablersConfig)
 	computeJSON, _ := json.Marshal(req.Compute)
 
+	// Serialize FleetWise config if provided
+	fleetwiseConfigJSON := ""
+	if req.FleetWiseConfig != nil {
+		fwJSON, _ := json.Marshal(req.FleetWiseConfig)
+		fleetwiseConfigJSON = string(fwJSON)
+	}
+
 	env := Environment{
-		ID:             fmt.Sprintf("env-%d", time.Now().Unix()),
-		Name:           req.Name,
-		Description:    req.Description,
-		Owner:          req.Owner,
-		Tags:           req.Tags,
-		Status:         "pending",
-		Capabilities:   string(capabilitiesJSON),
-		EnablersConfig: string(enablersJSON),
-		ComputeConfig:  string(computeJSON),
-		Storage:        req.Storage,
-		Network:        req.Network,
-		Priority:       req.Priority,
-		Duration:       req.Duration,
-		EstimatedCost:  estimatedCost,
-		ActualCost:     0,
-		Health:         100,
-		Uptime:         "0h",
-		CreatedAt:      time.Now(),
-		UpdatedAt:      time.Now(),
+		ID:                fmt.Sprintf("env-%d", time.Now().Unix()),
+		Name:              req.Name,
+		Description:       req.Description,
+		Owner:             req.Owner,
+		Tags:              req.Tags,
+		Status:            "pending",
+		Capabilities:      string(capabilitiesJSON),
+		EnablersConfig:    string(enablersJSON),
+		ComputeConfig:     string(computeJSON),
+		Storage:           req.Storage,
+		Network:           req.Network,
+		Priority:          req.Priority,
+		Duration:          req.Duration,
+		EstimatedCost:     estimatedCost,
+		ActualCost:        0,
+		Health:            100,
+		Uptime:            "0h",
+		FleetWiseConfig:   fleetwiseConfigJSON,
+		UseRealAWSBackend: req.UseRealAWSBackend,
+		CreatedAt:         time.Now(),
+		UpdatedAt:         time.Now(),
 	}
 
 	if err := db.Create(&env).Error; err != nil {
@@ -401,8 +433,12 @@ func provisionEnvironment(c *gin.Context) {
 	}
 	db.Create(&transition)
 
-	// Simulate provisioning
-	go simulateProvisioning(id)
+	// Use real AWS or simulate provisioning based on flag
+	if env.UseRealAWSBackend && env.FleetWiseConfig != "" {
+		go provisionAWSFleetWise(id, env.FleetWiseConfig)
+	} else {
+		go simulateProvisioning(id)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Provisioning started"})
 }
@@ -703,23 +739,126 @@ func updateUptime(envID string) {
 	startTime := time.Now()
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
-	
+
 	for range ticker.C {
 		var env Environment
 		if err := db.First(&env, "id = ?", envID).Error; err != nil {
 			return
 		}
-		
+
 		if env.Status != "running" {
 			return
 		}
-		
+
 		duration := time.Since(startTime)
 		uptime := fmt.Sprintf("%dd %dh", int(duration.Hours()/24), int(duration.Hours())%24)
-		
+
 		db.Model(&env).Updates(map[string]interface{}{
 			"uptime":      uptime,
 			"actual_cost": env.EstimatedCost * (duration.Hours() / 24),
 		})
 	}
+}
+
+// provisionAWSFleetWise provisions an environment using real AWS IoT FleetWise
+func provisionAWSFleetWise(envID string, configJSON string) {
+	log.Printf("Starting real AWS FleetWise provisioning for environment: %s", envID)
+
+	// Parse FleetWise configuration
+	var config FleetWiseConfig
+	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+		log.Printf("Error parsing FleetWise config: %v", err)
+		updateEnvironmentStatusWithError(envID, "error", fmt.Sprintf("Failed to parse FleetWise config: %v", err))
+		return
+	}
+
+	// Create FleetWise client
+	client, err := NewAWSFleetWiseClient(config.Region)
+	if err != nil {
+		log.Printf("Error creating FleetWise client: %v", err)
+		updateEnvironmentStatusWithError(envID, "error", fmt.Sprintf("Failed to create AWS client: %v", err))
+		return
+	}
+
+	// Update status to validating
+	updateEnvironmentStatusWithTransition(envID, "provisioning", "Validating FleetWise configuration")
+	time.Sleep(1 * time.Second)
+
+	// Provision the environment
+	err = client.ProvisionFleetWiseEnvironment(envID, config)
+	if err != nil {
+		log.Printf("Error provisioning FleetWise environment: %v", err)
+		updateEnvironmentStatusWithError(envID, "error", fmt.Sprintf("Provisioning failed: %v", err))
+		return
+	}
+
+	// Update status to running
+	updateEnvironmentStatusWithTransition(envID, "running", "AWS FleetWise environment provisioned successfully")
+
+	// Update health to 95-100 (real AWS environment)
+	var env Environment
+	db.First(&env, "id = ?", envID)
+	db.Model(&env).Updates(map[string]interface{}{
+		"health":     95 + rand.Intn(5),
+		"updated_at": time.Now(),
+	})
+
+	log.Printf("Successfully provisioned AWS FleetWise environment: %s", envID)
+
+	// Start uptime tracking
+	go updateUptime(envID)
+}
+
+// Helper function to update environment status with transition
+func updateEnvironmentStatusWithTransition(envID, status, reason string) {
+	var env Environment
+	db.First(&env, "id = ?", envID)
+
+	oldStatus := env.Status
+	db.Model(&env).Updates(map[string]interface{}{
+		"status":     status,
+		"updated_at": time.Now(),
+	})
+
+	transition := StateTransition{
+		EnvironmentID: envID,
+		FromState:     oldStatus,
+		ToState:       status,
+		Reason:        reason,
+		CreatedAt:     time.Now(),
+	}
+	db.Create(&transition)
+}
+
+// Helper function to update environment with error status
+func updateEnvironmentStatusWithError(envID, status, errorMsg string) {
+	var env Environment
+	db.First(&env, "id = ?", envID)
+
+	oldStatus := env.Status
+	db.Model(&env).Updates(map[string]interface{}{
+		"status":     status,
+		"health":     0,
+		"updated_at": time.Now(),
+	})
+
+	transition := StateTransition{
+		EnvironmentID: envID,
+		FromState:     oldStatus,
+		ToState:       status,
+		Reason:        errorMsg,
+		Metadata:      fmt.Sprintf(`{"error": "%s"}`, errorMsg),
+		CreatedAt:     time.Now(),
+	}
+	db.Create(&transition)
+
+	// Create audit log for error
+	auditLog := AuditLog{
+		EnvironmentID: envID,
+		Action:        "provisioning_failed",
+		UserID:        "system",
+		Details:       fmt.Sprintf(`{"error": "%s"}`, errorMsg),
+		CreatedAt:     time.Now(),
+	}
+	db.Create(&auditLog)
 }
